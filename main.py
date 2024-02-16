@@ -1,8 +1,10 @@
 import time
 from typing import Callable, Union
-from fastapi import APIRouter, FastAPI, Request, Response, UploadFile, File, HTTPException, Header
+from fastapi import APIRouter, FastAPI, Request, Response, UploadFile, File, HTTPException, Header, Form
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydub import AudioSegment
 from fastapi.routing import APIRoute
+from pydantic import BaseModel
 # from fastapi.middleware.cors import CORSMiddleware
 import os
 import librosa
@@ -17,25 +19,16 @@ import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient
 from fastapi.security import APIKeyHeader
-from typing import Annotated
+from typing import Annotated, AsyncIterator
 # from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.cors import CORSMiddleware as CORSMiddleware
+from datetime import datetime
+from fastapi.logger import logger
+from typing import List
+from starlette.concurrency import iterate_in_threadpool
+import json
 
 
-# def create_app() -> CORSMiddleware:
-#     """Create app wrapper to overcome middleware issues."""
-#     fastapi_app = FastAPI()
-#     fastapi_app.include_router(APIRouter)
-#     return CORSMiddleware(
-#         fastapi_app,
-#         allow_origins=["*"],
-#         allow_credentials=True,
-#         allow_methods=["*"],
-#         allow_headers=["*"],
-#     )
-
-
-# app = create_app()
 app = FastAPI()
 load_dotenv()
 
@@ -47,25 +40,98 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    # expose_headers=["*"]
 )
 
-# Set up logging
-# logging.basicConfig(level=logging.INFO)
-
-
-
-
-# Set up MongoDB connection
 print(os.getenv('MONGO_DB'))
-# mongo_client = MongoClient(os.getenv('MONGO_DB'))
-# mongo_db = mongo_client["ChordsdotzipDB"]
-# mongo_collection = mongo_db["logging"]
-client = AsyncIOMotorClient(os.getenv('MONGO_DB'))
+client = MongoClient(os.getenv('MONGO_DB'))
 database = client["ChordsdotzipDB"]
 collection = database["logging"]
 
 API_KEY:str = os.getenv('API_KEY')
+
+class AuditLog(BaseModel):
+    timestamp: str
+    total_time: float
+    path: str
+    method: str
+    status_code: int
+    client: str
+    url:str
+    chords: List[List[str]]
+  
+
+@app.middleware('http')
+async def audit_middleware(request: Request, call_next):
+    start_time = datetime.utcnow()
+    print('req: ',request)
+    response = await call_next(request)
+    response_body = [section async for section in response.body_iterator]
+    response.body_iterator = iterate_in_threadpool(iter(response_body))
+    res_body = response_body[0].decode()
+    if res_body[0] == '{':
+        res_body = json.loads(response_body[0].decode())
+    
+    end_time = datetime.utcnow()
+    elapsed_time = (end_time - start_time).total_seconds() * 1000  # Convert to milliseconds
+    print('res: ',response)
+    chords = [[""]]
+    url = ""
+    if "chords" in res_body['detail']:
+        chords = res_body['detail']['chords']
+    if "url" in res_body['detail'] :  
+        url =  res_body['detail']['url'] 
+    audit_log = AuditLog(
+        timestamp=start_time.isoformat(),
+        total_time=elapsed_time,
+        path=request.url.path,
+        method=request.method,
+        status_code=response.status_code,
+        client=request.client.host,
+        url=url,
+        chords=chords,
+    )
+    collection.insert_one(audit_log.dict())
+    return response
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+
+def split_audio(file_path: str, segment_length_ms: int = 500):
+    x, sr = librosa.load(file_path)
+    segments = [x[i:i + int(sr * segment_length_ms / 1000)] for i in range(0, len(x), int(sr * segment_length_ms / 1000))]
+    return segments, sr
+
+def create_chroma_features(segments,sr):
+    chroma_features = []
+    for i, segment in enumerate(segments):
+        chroma = librosa.feature.chroma_cqt(y=segment, sr=sr)
+        arr = []
+        for i in range(len(chroma)):
+            chroma[i] = sum(chroma[i])/len(chroma[i])
+            arr.append(chroma[i][0])
+        chroma_features.append(arr)
+    return chroma_features
+
+def count_contiguous_chords(chords):
+    chord_counts = []
+    current_chord = None
+    count = 0
+
+    for chord in chords:
+        if chord == current_chord:
+            count += 1
+        else:
+            if current_chord is not None:
+                chord_counts.append([current_chord, count])
+            current_chord = chord
+            count = 1
+
+    # Add the last chord and count
+    if current_chord is not None:
+        chord_counts.append([current_chord, count])
+
+    return chord_counts
+
+
 
 
 
@@ -126,52 +192,16 @@ def read_root():
 def test_cors():
     return {"message": "CORS test successful"}
 
-@app.get("/items/")
+@app.get("/items")
 async def read_items(user_agent: Annotated[str | None, Header()] = None):
     print(user_agent)
     return {"User-Agent": user_agent}
 
 
 
-def split_audio(file_path: str, segment_length_ms: int = 500):
-    x, sr = librosa.load(file_path)
-    segments = [x[i:i + int(sr * segment_length_ms / 1000)] for i in range(0, len(x), int(sr * segment_length_ms / 1000))]
-    return segments, sr
 
-def create_chroma_features(segments,sr):
-    chroma_features = []
-    for i, segment in enumerate(segments):
-        chroma = librosa.feature.chroma_cqt(y=segment, sr=sr)
-        arr = []
-        for i in range(len(chroma)):
-            chroma[i] = sum(chroma[i])/len(chroma[i])
-            arr.append(chroma[i][0])
-        chroma_features.append(arr)
-    return chroma_features
-
-def count_contiguous_chords(chords):
-    chord_counts = []
-    current_chord = None
-    count = 0
-
-    for chord in chords:
-        if chord == current_chord:
-            count += 1
-        else:
-            if current_chord is not None:
-                chord_counts.append([current_chord, count])
-            current_chord = chord
-            count = 1
-
-    # Add the last chord and count
-    if current_chord is not None:
-        chord_counts.append([current_chord, count])
-
-    return chord_counts
-
-
-@app.post("/files/")
-async def create_file(file: UploadFile = File()):
+@app.post("/files")
+async def create_file(file: UploadFile = File(),url:str = Form()):
     warnings.filterwarnings('ignore')
     if file.content_type not in {"audio/mpeg", "audio/mp3", "audio/wav", "video/mp4",'audio/x-wav'}:
         raise HTTPException(status_code=400, detail="Only MP3, MP4, WAV files are supported.")
@@ -188,19 +218,9 @@ async def create_file(file: UploadFile = File()):
         chroma = [chroma]
         chord = myModel.predict(chroma)
         chords.append(chord[0])
-    # chords = count_contiguous_chords(chords)
     try:
         os.remove(file_path)
         print(f"The file '{file_path}' has been deleted successfully.")
     except OSError as e:
         print(f"Error deleting the file '{file_path}': {e}")
-    # log_entry = {
-    #     "route": request.url.path,
-    #     "duration": duration,
-    #     "response": response.body.decode("utf-8"),
-    #     "headers": dict(response.headers),
-    #     "timestamp": time.time()
-    # }
-
-    # result = await collection.insert_one(log_entry)
-    return {'chords':[chords]}
+    return HTTPException(status_code=200, detail={'chords':[chords],'url':url})
