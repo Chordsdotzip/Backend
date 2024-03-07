@@ -5,7 +5,6 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydub import AudioSegment
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
-# from fastapi.middleware.cors import CORSMiddleware
 import os
 import librosa
 import numpy as np
@@ -20,8 +19,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient
 from fastapi.security import APIKeyHeader
 from typing import Annotated, AsyncIterator
-# from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.cors import CORSMiddleware as CORSMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from datetime import datetime
 from fastapi.logger import logger
 from typing import List
@@ -32,7 +30,7 @@ import json
 app = FastAPI()
 load_dotenv()
 
-origins = ["*"]
+origins = ["https://chordsdotzip.netlify.app"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,28 +56,48 @@ class AuditLog(BaseModel):
     client: str
     url:str
     chords: List[List[str]]
+
+
+async def api_key_middleware(request: Request, API_KEY: str):
+    print(request.headers)
+    print(API_KEY)
+    api_key = request.headers.get('authorization')
+    if api_key:
+        api_key = api_key.split(" ")[1]
+    print(api_key)
+    if not api_key or api_key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return
   
 
 @app.middleware('http')
 async def audit_middleware(request: Request, call_next):
+    # x = await api_key_middleware(request,os.getenv('API_KEY'))
+    # print('x: ',x)
     start_time = datetime.utcnow()
-    print('req: ',request)
     response = await call_next(request)
     response_body = [section async for section in response.body_iterator]
     response.body_iterator = iterate_in_threadpool(iter(response_body))
     res_body = response_body[0].decode()
     if res_body[0] == '{':
-        res_body = json.loads(response_body[0].decode())
+        res_body = json.loads(res_body)
     
     end_time = datetime.utcnow()
     elapsed_time = (end_time - start_time).total_seconds() * 1000  # Convert to milliseconds
-    print('res: ',response)
+    print('res: ',res_body)
     chords = [[""]]
     url = ""
-    if "chords" in res_body['detail']:
-        chords = res_body['detail']['chords']
-    if "url" in res_body['detail'] :  
-        url =  res_body['detail']['url'] 
+    if "detail" in res_body:
+        if "chords" in res_body['detail']:
+            chords = res_body['detail']['chords']
+        if "url" in res_body['detail'] :  
+            url =  res_body['detail']['url'] 
+    else:
+        return response
     audit_log = AuditLog(
         timestamp=start_time.isoformat(),
         total_time=elapsed_time,
@@ -93,7 +111,7 @@ async def audit_middleware(request: Request, call_next):
     collection.insert_one(audit_log.dict())
     return response
 
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+
 
 def split_audio(file_path: str, segment_length_ms: int = 500):
     x, sr = librosa.load(file_path)
@@ -165,28 +183,14 @@ def count_contiguous_chords(chords):
 # api_key_header = APIKeyHeader(name="authorization", auto_error=False)
 
 
-# async def api_key_middleware(request: Request, call_next):
-#     print(request.headers)
-#     print(request)
-#     api_key = await api_key_header(request).split[1]
-#     print(api_key)
-#     if not api_key or api_key != API_KEY:
-#         raise HTTPException(
-#             status_code=401,
-#             detail="Invalid API key",
-#             headers={"WWW-Authenticate": "Bearer"},
-#         )
 
-#     response = await call_next(request)
-#     return response
 
-# app.middleware('http')(api_key_middleware)
 
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World!"}
+    return {"test_connection":"Hello, World!"}
 
 @app.get("/test-cors")
 def test_cors():
